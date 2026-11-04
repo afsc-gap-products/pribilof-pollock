@@ -25,7 +25,7 @@ this_year <- as.numeric(format(Sys.Date(), "%Y"))
 kts <- 250  # Number of knots for the index model mesh
 
 # Whether abundance will be in "numbers" or "biomass"
-data_type <- "numbers"
+data_type <- "biomass"
 
 # Make a new directory for the model output
 results_wd <- here("results", data_type, paste0(kts, "kts"))
@@ -136,9 +136,10 @@ fit_time
 sanity(fit)
 summary(fit)
 
-# Safer file saving (hopefully)
-temp_f1 <- tempfile(fileext = ".RDS")
-saveRDS(fit, file = here(results_wd, temp_f1), compress = TRUE)
+# Safer file saving
+temp_f1 <- tempfile(tmpdir = results_wd, fileext = ".RDS")
+saveRDS(fit, file = temp_f1, compress = TRUE)
+file.rename(temp_f1, f1)
 
 # Extra optimization if needed
 # fit_opt <- run_extra_optimization(fit)
@@ -147,16 +148,18 @@ saveRDS(fit, file = here(results_wd, temp_f1), compress = TRUE)
 # Make predictions and index --------------------------------------------------
 # Read in fit if object is not already in environment
 if(!exists("fit")) {
-  fit <- sdmTMB:::reload_model(here(results_wd, "fit.RDS"))
+  fit <- sdmTMB:::reload_model(readRDS(here(results_wd, "fit.RDS")))
 }
 
 # Calculate index for each area
-index_by_area <- function(reg) {
+# Set use_sims = TRUE for fast simulation-based index (get_index_sims),
+# or use_sims = FALSE for exact Laplace bias-corrected index (get_index).
+index_by_area <- function(reg, use_sims = FALSE, nsim = 500) {
   start <- Sys.time()  # start timer
   # Load in prediction grid created in prib_areas.R
-  load(here("shapefiles", "processed", reg, "grid_5nm.Rdata"))  # this is grid_list
+  load(here("shapefiles", "processed", reg, "grid.Rdata"))  # this is grid_list
 
-  # Subset grid_list to include the "all" polygon and 50-125km.
+  # Subset grid_list to include the "all" polygon and 25-125km.
   grid_list <- grid_list[c(1:6)]
   
   # Create a folder for each index area
@@ -165,65 +168,76 @@ index_by_area <- function(reg) {
   }
   
   ind_list <- vector("list", length = length(grid_list))
-  for(i in 1:length(grid_list)) {
+  for(i in seq_along(grid_list)) {
     df <- grid_list[[i]]
-    stratum <- unique(df$stratum)  # for later labelling
+    stratum <- as.character(unique(df$stratum))  # for later labelling
 
-    # Create prediction grid
-    pred_grid <- replicate_df(data.frame(df), "year_f", unique(dat$year_f))
-    pred_grid$year <- as.integer(as.character(factor(pred_grid$year_f)))
+    pred_file <- here(results_wd, reg, paste0("pred_data_", stratum, ".rds"))
+    ind_file  <- here(results_wd, reg, paste0("index_", stratum, ".csv"))
+    map_file  <- here(results_wd, reg, paste0("log_pred_map_", stratum, ".pdf"))
+
+    if (!file.exists(ind_file) || !file.exists(pred_file)) {
+      # Create prediction grid
+      pred_grid <- replicate_df(data.frame(df), "year_f", unique(dat$year_f))
+      pred_grid$year <- as.integer(as.character(factor(pred_grid$year_f)))
       
-    # join with environmental covariate (cold pool)
-    pred_grid <- left_join(pred_grid, env, by = "year")
-    
-    # Get predictions (if hasn't been done already) or load saved file
-    pred_file <- here(results_wd, reg, paste0("pred_", stratum,".Rdata"))
-    if (!file.exists(pred_file)) {
-      # get predictions
-      print(paste0("Predicting for ", reg, " ", stratum))
-      p <- predict(fit, newdata = pred_grid, return_tmb_object = TRUE,
-                  offset = rep(0, nrow(pred_grid)))
-      save(p, file = here(results_wd, reg, paste0("pred_", stratum,".Rdata")))
+      # join with environmental covariate (cold pool)
+      pred_grid <- left_join(pred_grid, env, by = "year")
+      
+      print(paste0("Predicting and calculating index for ", reg, " ", stratum))
+      if (use_sims) {
+        pdata <- predict(fit, newdata = pred_grid,
+                         offset = rep(0, nrow(pred_grid)))
+        saveRDS(pdata, file = pred_file, compress = FALSE)
 
-    } else {
-      print(paste0("Predictions already exist for ", reg, " ", stratum, "; loading from file"))
-      load(pred_file)  # this is p
-    }
+        p_sims <- predict(fit, newdata = pred_grid, nsim = nsim,
+                          offset = rep(0, nrow(pred_grid)))
+        ind <- get_index_sims(p_sims, area = pred_grid$area_km2 * 100)
+        rm(p_sims)
+      } else {
+        p <- predict(fit, newdata = pred_grid, return_tmb_object = TRUE,
+                     offset = rep(0, nrow(pred_grid)))
+        pdata <- p$data
+        saveRDS(pdata, file = pred_file, compress = FALSE)
 
-    # get index
-    ind_file <- here(results_wd, reg, paste0("index_", stratum, ".csv"))
-    ind <- get_index(p, bias_correct = TRUE, area = p$data$area_km2)
-    ind$stratum <- stratum
-    ind$region <- reg
-
-    write.csv(ind, 
-        file = here(results_wd, reg, paste0("index_", stratum, ".csv")), 
-        row.names = FALSE
-      )
-    
-        # Map of predicted density
-    pdata <- p$data
-    # pdata$stratum <- stratum
-    pred_map <- ggplot(pdata, aes(X, Y, fill = est1 + est2)) +
-      geom_tile(width = 10, height = 10) +
-      scale_fill_viridis_c(name = "") +
-      scale_x_continuous(breaks = c(250, 750)) +
-      scale_y_continuous(breaks = c(6000, 6500, 7000)) +
-      facet_wrap(~year) +
-      xlab("") + ylab("") +
-      coord_fixed() +
-      {
-        if (data_type == "numbers") {
-          ggtitle(expression("Predicted log density (numbers / km"^2*")"))
-        } else if (data_type == "biomass") {
-          ggtitle(expression("Predicted log density (kg / km"^2*")"))
-        }
+        ind <- get_index(p, bias_correct = TRUE, area = pdata$area_km2 * 100)
+        rm(p)
       }
+      gc()
+
+      ind$stratum <- stratum
+      ind$region <- reg
+
+      write.csv(ind, file = ind_file, row.names = FALSE)
+    } else {
+      print(paste0("Index and predictions already exist for ", reg, " ", stratum, "; loading from file"))
+      pdata <- readRDS(pred_file)
+      ind <- read.csv(ind_file)
+      ind$stratum <- as.character(ind$stratum)
+    }
     
-    ggsave(pred_map, file = here(results_wd, reg, paste0("log_pred_map_", stratum, ".pdf")),
-           height = 7, width = 7, units = "in")
+    # Map of predicted density
+    if (!file.exists(map_file)) {
+      pred_map <- ggplot(pdata, aes(X, Y, fill = est1 + est2 + log(100))) +
+        geom_tile(width = 10, height = 10) +
+        scale_fill_viridis_c(name = "") +
+        scale_x_continuous(breaks = c(250, 750)) +
+        scale_y_continuous(breaks = c(6000, 6500, 7000)) +
+        facet_wrap(~year) +
+        xlab("") + ylab("") +
+        coord_fixed() +
+        {
+          if (data_type == "numbers") {
+            ggtitle(expression("Predicted log density (numbers / km"^2*")"))
+          } else if (data_type == "biomass") {
+            ggtitle(expression("Predicted log density (kg / km"^2*")"))
+          }
+        }
+      
+      ggsave(pred_map, file = map_file, height = 7, width = 7, units = "in")
+    }
     
-      ind_list[[i]] <- ind
+    ind_list[[i]] <- ind
   }
 
   ind_df <- bind_rows(ind_list)
@@ -234,13 +248,38 @@ index_by_area <- function(reg) {
   return(ind_df)
 }
 
-stg <- index_by_area("STG")
-stg_n <- index_by_area("STG_North")
-stg_s <- index_by_area("STG_South")
-stp <- index_by_area("STP")
-stp_e <- index_by_area("STP_East")
-stp_eb <- index_by_area("STP_EB")
-stp_rp <- index_by_area("STP_Reef_Point")
+region_names <- c("STG", "STG_North", "STG_South", "STP", "STP_East", "STP_EB", "STP_Reef_Point")
+
+# Set n_workers > 1 to run regions in parallel (each worker uses ~2-3 GB RAM)
+n_workers <- 1
+if (n_workers > 1) {
+  cl <- parallel::makeCluster(n_workers)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  parallel::clusterExport(cl, c("fit", "dat", "env", "results_wd", "data_type", "index_by_area"))
+  parallel::clusterEvalQ(cl, {
+    library(sdmTMB)
+    library(dplyr)
+    library(ggplot2)
+    library(here)
+    library(ggsidekick)
+    theme_set(theme_sleek())
+    sdmTMB:::reinitialize(fit)
+  })
+  indices_list <- parallel::parLapply(cl, region_names, index_by_area)
+  parallel::stopCluster(cl)
+  on.exit()
+} else {
+  indices_list <- lapply(region_names, index_by_area)
+}
+
+names(indices_list) <- region_names
+stg    <- indices_list[["STG"]]
+stg_n  <- indices_list[["STG_North"]]
+stg_s  <- indices_list[["STG_South"]]
+stp    <- indices_list[["STP"]]
+stp_e  <- indices_list[["STP_East"]]
+stp_eb <- indices_list[["STP_EB"]]
+stp_rp <- indices_list[["STP_Reef_Point"]]
 
 # Alternatively, read in existing index files ---------------------------------
 # read_index <- function(reg) {

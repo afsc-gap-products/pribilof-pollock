@@ -31,9 +31,10 @@ data_type <- "biomass"
 results_wd <- here("results", data_type, paste0(kts, "kts"))
 dir.create(here(results_wd), recursive = TRUE, showWarnings = FALSE)
 
-# Read in data
+# Read in data (convert DDC CPUE from per-hectare to per-km^2 to match area_km2)
 if(data_type == "numbers") {
   dat <- read.csv(here("data", "ddc_num.csv"))
+  dat$cpue <- dat$cpue * 100
 }
 
 if(data_type == "biomass") {
@@ -62,6 +63,7 @@ if(data_type == "biomass") {
     dat <- read.csv(file)
   }
   colnames(dat)[3:5] <- c("lat", "lon", "cpue")
+  dat$cpue <- dat$cpue * 100
 }
 
 # Check for NAs
@@ -192,7 +194,7 @@ index_by_area <- function(reg, use_sims = FALSE, nsim = 500) {
 
         p_sims <- predict(fit, newdata = pred_grid, nsim = nsim,
                           offset = rep(0, nrow(pred_grid)))
-        ind <- get_index_sims(p_sims, area = pred_grid$area_km2 * 100)
+        ind <- get_index_sims(p_sims, area = pred_grid$area_km2)
         rm(p_sims)
       } else {
         p <- predict(fit, newdata = pred_grid, return_tmb_object = TRUE,
@@ -200,7 +202,7 @@ index_by_area <- function(reg, use_sims = FALSE, nsim = 500) {
         pdata <- p$data
         saveRDS(pdata, file = pred_file, compress = FALSE)
 
-        ind <- get_index(p, bias_correct = TRUE, area = pdata$area_km2 * 100)
+        ind <- get_index(p, bias_correct = TRUE, area = pdata$area_km2)
         rm(p)
       }
       gc()
@@ -218,7 +220,7 @@ index_by_area <- function(reg, use_sims = FALSE, nsim = 500) {
     
     # Map of predicted density
     if (!file.exists(map_file)) {
-      pred_map <- ggplot(pdata, aes(X, Y, fill = est1 + est2 + log(100))) +
+      pred_map <- ggplot(pdata, aes(X, Y, fill = est1 + est2)) +
         geom_tile(width = 10, height = 10) +
         scale_fill_viridis_c(name = "") +
         scale_x_continuous(breaks = c(250, 750)) +

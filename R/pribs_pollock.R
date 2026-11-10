@@ -250,24 +250,38 @@ index_by_area <- function(reg, use_sims = FALSE, nsim = 500) {
   return(ind_df)
 }
 
-region_names <- c("STG", "STG_North", "STG_South", "STP", "STP_East", "STP_EB", "STP_Reef_Point")
+# Order regions from largest grid (STP: 2,542 cells) to smallest (STG_South: 500 cells)
+# so load-balanced parallel workers start the heaviest regions first.
+region_names <- c("STP", "STP_Reef_Point", "STP_EB", "STP_East", "STG", "STG_North", "STG_South")
 
-# Set n_workers > 1 to run regions in parallel (each worker uses ~2-3 GB RAM)
-n_workers <- 1
-if (n_workers > 1) {
+# Optimized for 32 GB RAM Windows Xeon VM (AKC-VU-030):
+# Each worker peaks at ~3.5-4.5 GB RAM during TMB Laplace bias correction on STP,
+# so capping at 4 workers keeps total memory comfortably under 32 GB without paging.
+n_cores <- parallel::detectCores(logical = FALSE)
+n_workers <- min(4L, max(1L, if (is.na(n_cores)) 2L else n_cores - 1L))
+
+if (n_workers > 1L) {
   cl <- parallel::makeCluster(n_workers)
   on.exit(parallel::stopCluster(cl), add = TRUE)
   parallel::clusterExport(cl, c("fit", "dat", "env", "results_wd", "data_type", "index_by_area"))
   parallel::clusterEvalQ(cl, {
+    # Prevent OpenMP / BLAS thread oversubscription across parallel workers
+    Sys.setenv(
+      OMP_NUM_THREADS = "1",
+      OPENBLAS_NUM_THREADS = "1",
+      MKL_NUM_THREADS = "1"
+    )
     library(sdmTMB)
     library(dplyr)
     library(ggplot2)
     library(here)
     library(ggsidekick)
     theme_set(theme_sleek())
+    TMB::openmp(n = 1L, DLL = "sdmTMB")
     sdmTMB:::reinitialize(fit)
+    NULL
   })
-  indices_list <- parallel::parLapply(cl, region_names, index_by_area)
+  indices_list <- parallel::parLapplyLB(cl, region_names, index_by_area)
   parallel::stopCluster(cl)
   on.exit()
 } else {
